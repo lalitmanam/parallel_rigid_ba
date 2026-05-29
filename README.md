@@ -30,7 +30,7 @@ cd parallel_rigid_ba
 ```
 
 Requirements:
-Install prerequisutes of Glomap 1.2.0
+Install prerequisites for Glomap 1.2.0
 ```
 git clone --branch 1.2.0  https://github.com/colmap/glomap.git
 ```
@@ -38,7 +38,7 @@ Installation instructions: https://github.com/colmap/glomap/blob/main/README.md#
 
 ### Apply Patch on Glomap and Install
 
-After installing the prerequisites of Glomap 1.2.0, apply the patch and install Glomap.
+After installing the prerequisites for Glomap 1.2.0, apply the patch and install Glomap.
 
 ```
 cd glomap
