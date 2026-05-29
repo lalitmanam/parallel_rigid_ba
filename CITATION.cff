@@ -1,0 +1,25 @@
+# Copyright (c) 2026, Lalit Manam
+
+
+cff-version: 1.2.0
+message: If you use this software, please cite it using the preferred citation below.
+title: "Parallel Rigidity Matters for Bundle Adjustment"
+type: software
+authors:
+  - family-names: Manam
+    given-names: Lalit
+  - family-names: Govindu
+    given-names: Venu Madhav
+license: BSD 3-Clause
+repository-code: "https://github.com/merlresearch/parallel_rigid_glomap"
+preferred-citation:
+  type: conference-paper
+  authors:
+    - family-names: Manam
+      given-names: Lalit
+    - family-names: Govindu
+      given-names: Venu Madhav
+  title: "Parallel Rigidity Matters for Bundle Adjustment"
+  conference:
+    name: "Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)"
+  year: 2026

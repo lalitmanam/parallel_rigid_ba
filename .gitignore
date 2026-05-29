@@ -1,0 +1,14 @@
+# Copyright (c) 2026, Lalit Manam
+
+# C++ .gitignore from https://github.com/github/gitignore/blob/main/C%2B%2B.gitignore
+
+# Custom ignores
+.DS_Store
+.cache/
+build/
+CMakeCache.txt
+CMakeFiles
+CMakeScripts
+cmake_install.cmake
+install_manifest.txt
+CTestTestfile.cmake

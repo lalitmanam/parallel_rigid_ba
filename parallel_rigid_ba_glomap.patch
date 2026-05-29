@@ -1,0 +1,1239 @@
+diff --git a/glomap/controllers/global_mapper.cc b/glomap/controllers/global_mapper.cc
+index f5af2bb..efd67c5 100644
+--- a/glomap/controllers/global_mapper.cc
++++ b/glomap/controllers/global_mapper.cc
+@@ -10,8 +10,10 @@
+ #include "glomap/processors/track_filter.h"
+ #include "glomap/processors/view_graph_manipulation.h"
+
++// For saving reconstruction at different stages
++#include "glomap/io/colmap_io.h"
++
+ #include <colmap/util/file.h>
+-#include <colmap/util/timer.h>
+
+ namespace glomap {
+
+@@ -22,7 +24,10 @@ bool GlobalMapper::Solve(const colmap::Database& database,
+                          std::unordered_map<camera_t, Camera>& cameras,
+                          std::unordered_map<frame_t, Frame>& frames,
+                          std::unordered_map<image_t, Image>& images,
+-                         std::unordered_map<track_t, Track>& tracks) {
++                         std::unordered_map<track_t, Track>& tracks,
++                         std::string output_path_wo_retri,
++                         std::string image_path,
++                         std::string output_format) {
+   // 0. Preprocessing
+   if (!options_.skip_preprocessing) {
+     std::cout << "-------------------------------------" << std::endl;
+@@ -38,6 +43,13 @@ bool GlobalMapper::Solve(const colmap::Database& database,
+     run_timer.PrintSeconds();
+   }
+
++  if (view_graph.KeepLargestConnectedComponents(frames, images) == 0) {
++    LOG(ERROR) << "No connected components are found";
++    return false;
++  } else {
++    LOG(INFO) << "Largest connected component extracted";
++  }
++
+   // 1. Run view graph calibration
+   if (!options_.skip_view_graph_calibration) {
+     std::cout << "-------------------------------------" << std::endl;
+@@ -130,10 +142,24 @@ bool GlobalMapper::Solve(const colmap::Database& database,
+
+     // Filter the tracks
+     track_t num_tracks = track_engine.FindTracksForProblem(tracks_full, tracks);
+-    LOG(INFO) << "Before filtering: " << tracks_full.size()
+-              << ", after filtering: " << num_tracks << std::endl;
++    LOG(INFO) << "Total available tracks: " << tracks_full.size()
++              << ", Num tracks chosen: " << num_tracks << std::endl;
+
+     run_timer.PrintSeconds();
++
++    // Filter tracks for generic parallel rigidity
++    if (options_.use_gpr_ba) {
++      LOG(INFO) << "Filtering tracks for generic parallel rigidity after "
++                   "establishing tracks\n";
++      run_timer.Restart();
++
++      if (TrackFilter::FilterTracksGenericParallelRigidityViaViewgraph(
++              view_graph, frames, images, tracks) == 0) {
++        LOG(ERROR) << "No tracks left after PR BA filter!";
++        return false;
++      }
++      run_timer.PrintSeconds();
++    }
+   }
+
+   // 5. Global positioning
+@@ -142,12 +168,6 @@ bool GlobalMapper::Solve(const colmap::Database& database,
+     std::cout << "Running global positioning ..." << std::endl;
+     std::cout << "-------------------------------------" << std::endl;
+
+-    if (options_.opt_gp.constraint_type !=
+-        GlobalPositionerOptions::ConstraintType::ONLY_POINTS) {
+-      LOG(ERROR) << "Only points are used for solving camera positions";
+-      return false;
+-    }
+-
+     colmap::Timer run_timer;
+     run_timer.Start();
+     // Undistort images in case all previous steps are skipped
+@@ -160,32 +180,69 @@ bool GlobalMapper::Solve(const colmap::Database& database,
+     if (!gp_engine.Solve(view_graph, rigs, cameras, frames, images, tracks)) {
+       return false;
+     }
+-    // Filter tracks based on the estimation
++
++    // Copying below code snippet from initial release of GLOMAP
++    // to support only camera-to-camera constraints
++    // If only camera-to-camera constraints are used for solving camera
++    // positions, then points needs to be estimated separately
++    if (options_.opt_gp.constraint_type ==
++        GlobalPositionerOptions::ConstraintType::ONLY_CAMERAS) {
++      GlobalPositionerOptions opt_gp_pt = options_.opt_gp;
++      opt_gp_pt.constraint_type =
++          GlobalPositionerOptions::ConstraintType::ONLY_POINTS;
++      opt_gp_pt.optimize_positions = false;
++      GlobalPositioner gp_engine_pt(opt_gp_pt);
++      if (!gp_engine_pt.Solve(
++              view_graph, rigs, cameras, frames, images, tracks)) {
++        return false;
++      }
++    }
++
++    // // Filter tracks based on the estimation
+     TrackFilter::FilterTracksByAngle(
+         view_graph,
+         cameras,
+         images,
+         tracks,
+-        options_.inlier_thresholds.max_angle_error);
++        options_.inlier_thresholds.max_angle_error,
++        options_.use_gpr_ba || options_.use_hof_tracks);
++
++    // Removing below filters to examine the impact of generic parallel rigidity
++    // in BA
++    // // Filter tracks based on triangulation angle and reprojection error
++    // TrackFilter::FilterTrackTriangulationAngle(
++    //     view_graph,
++    //     images,
++    //     tracks,
++    //     options_.inlier_thresholds.min_triangulation_angle);
++    // // Set the threshold to be larger to avoid removing too many tracks
++    // TrackFilter::FilterTracksByReprojection(
++    //     view_graph,
++    //     cameras,
++    //     images,
++    //     tracks,
++    //     10 * options_.inlier_thresholds.max_reprojection_error);
+
+-    // Filter tracks based on triangulation angle and reprojection error
+-    TrackFilter::FilterTrackTriangulationAngle(
+-        view_graph,
+-        images,
+-        tracks,
+-        options_.inlier_thresholds.min_triangulation_angle);
+-    // Set the threshold to be larger to avoid removing too many tracks
+-    TrackFilter::FilterTracksByReprojection(
+-        view_graph,
+-        cameras,
+-        images,
+-        tracks,
+-        10 * options_.inlier_thresholds.max_reprojection_error);
+     // Normalize the structure
+     // If the camera rig is used, the structure do not need to be normalized
+     NormalizeReconstruction(rigs, cameras, frames, images, tracks);
+
+     run_timer.PrintSeconds();
++
++    // Filter tracks for generic parallel rigidity
++    if (options_.use_gpr_ba) {
++      LOG(INFO) << "Filtering tracks for generic parallel rigidity after "
++                   "global positioning and "
++                   "filtering tracks based on angles \n";
++      run_timer.Restart();
++
++      if (TrackFilter::FilterTracksGenericParallelRigidityViaViewgraph(
++              view_graph, frames, images, tracks) == 0) {
++        LOG(ERROR) << "No tracks left after PR BA filter!";
++        return false;
++      }
++      run_timer.PrintSeconds();
++    }
+   }
+
+   // 6. Bundle adjustment
+@@ -246,7 +303,8 @@ bool GlobalMapper::Solve(const colmap::Database& database,
+             cameras,
+             images,
+             tracks,
+-            scaling * options_.inlier_thresholds.max_reprojection_error);
++            scaling * options_.inlier_thresholds.max_reprojection_error,
++            options_.use_gpr_ba || options_.use_hof_tracks);
+
+         if (filtered_num > 1e-3 * tracks.size()) {
+           status = false;
+@@ -257,26 +315,61 @@ bool GlobalMapper::Solve(const colmap::Database& database,
+         LOG(INFO) << "fewer than 0.1% tracks are filtered, stop the iteration.";
+         break;
+       }
++
++      // Filter tracks for generic parallel rigidity
++      if (options_.use_gpr_ba) {
++        LOG(INFO) << "Filtering tracks for generic parallel rigidity after "
++                     "filtering tracks "
++                     "based on reprojection in the loop\n";
++        run_timer.Restart();
++
++        if (TrackFilter::FilterTracksGenericParallelRigidityViaViewgraph(
++                view_graph, frames, images, tracks) == 0) {
++          LOG(ERROR) << "No tracks left after PR BA filter!";
++          return false;
++        }
++        run_timer.PrintSeconds();
++      }
+     }
+
+     // Filter tracks based on the estimation
+     UndistortImages(cameras, images, true);
+-    LOG(INFO) << "Filtering tracks by reprojection ...";
+-    TrackFilter::FilterTracksByReprojection(
+-        view_graph,
+-        cameras,
+-        images,
+-        tracks,
+-        options_.inlier_thresholds.max_reprojection_error);
+-    TrackFilter::FilterTrackTriangulationAngle(
+-        view_graph,
+-        images,
+-        tracks,
+-        options_.inlier_thresholds.min_triangulation_angle);
++
++    // Removing below filters to examine the impact of generic parallel rigidity
++    // in BA LOG(INFO) << "Filtering tracks by reprojection ...";
++    // TrackFilter::FilterTracksByReprojection(
++    //     view_graph,
++    //     cameras,
++    //     images,
++    //     tracks,
++    //     options_.inlier_thresholds.max_reprojection_error,
++    //     options_.use_gpr_ba);
++    // TrackFilter::FilterTrackTriangulationAngle(
++    //     view_graph,
++    //     images,
++    //     tracks,
++    //     options_.inlier_thresholds.min_triangulation_angle);
+
+     run_timer.PrintSeconds();
+   }
+
++  if (output_path_wo_retri.compare(" ")) {
++    colmap::Timer run_timer_corr;
++    run_timer_corr.Start();
++    WriteGlomapReconstruction(output_path_wo_retri,
++                              rigs,
++                              cameras,
++                              frames,
++                              images,
++                              tracks,
++                              output_format,
++                              image_path);
++    run_timer_corr.Pause();
++    LOG(INFO) << "Export to COLMAP reconstruction done "
++                 "before retriangulation with time taken: "
++              << run_timer_corr.ElapsedSeconds();
++  }
++
+   // 7. Retriangulation
+   if (!options_.skip_retriangulation) {
+     std::cout << "-------------------------------------" << std::endl;
+@@ -323,18 +416,20 @@ bool GlobalMapper::Solve(const colmap::Database& database,
+
+     // Filter tracks based on the estimation
+     UndistortImages(cameras, images, true);
+-    LOG(INFO) << "Filtering tracks by reprojection ...";
+-    TrackFilter::FilterTracksByReprojection(
+-        view_graph,
+-        cameras,
+-        images,
+-        tracks,
+-        options_.inlier_thresholds.max_reprojection_error);
+-    TrackFilter::FilterTrackTriangulationAngle(
+-        view_graph,
+-        images,
+-        tracks,
+-        options_.inlier_thresholds.min_triangulation_angle);
++
++    // Removing below filters to examine the impact of generic parallel rigidity
++    // in BA LOG(INFO) << "Filtering tracks by reprojection ...";
++    // TrackFilter::FilterTracksByReprojection(
++    //     view_graph,
++    //     cameras,
++    //     images,
++    //     tracks,
++    //     options_.inlier_thresholds.max_reprojection_error);
++    // TrackFilter::FilterTrackTriangulationAngle(
++    //     view_graph,
++    //     images,
++    //     tracks,
++    //     options_.inlier_thresholds.min_triangulation_angle);
+   }
+
+   // 8. Reconstruction pruning
+diff --git a/glomap/controllers/global_mapper.h b/glomap/controllers/global_mapper.h
+index 4f4c344..e479b8d 100644
+--- a/glomap/controllers/global_mapper.h
++++ b/glomap/controllers/global_mapper.h
+@@ -9,6 +9,7 @@
+ #include "glomap/types.h"
+
+ #include <colmap/scene/database.h>
++#include <colmap/util/timer.h>
+
+ namespace glomap {
+
+@@ -39,6 +40,11 @@ struct GlobalMapperOptions {
+   bool skip_bundle_adjustment = false;
+   bool skip_retriangulation = false;
+   bool skip_pruning = true;
++
++  // For checking generic parallel rigidity for bipartite graph
++  bool use_gpr_ba = false;  // Apply generic parallel rigidity check on tracks
++                            // for bundle adjustment
++  bool use_hof_tracks = false;  // Apply hanging observation filter on tracks
+ };
+
+ // TODO: Refactor the code to reuse the pipeline code more
+@@ -52,7 +58,10 @@ class GlobalMapper {
+              std::unordered_map<camera_t, Camera>& cameras,
+              std::unordered_map<frame_t, Frame>& frames,
+              std::unordered_map<image_t, Image>& images,
+-             std::unordered_map<track_t, Track>& tracks);
++             std::unordered_map<track_t, Track>& tracks,
++             std::string output_path_wo_retri = " ",
++             std::string image_path = "",
++             std::string output_format = "");
+
+  private:
+   const GlobalMapperOptions options_;
+diff --git a/glomap/controllers/option_manager.cc b/glomap/controllers/option_manager.cc
+index 6035cbf..ed9b52b 100644
+--- a/glomap/controllers/option_manager.cc
++++ b/glomap/controllers/option_manager.cc
+@@ -81,6 +81,11 @@ void OptionManager::AddGlobalMapperOptions() {
+   AddAndRegisterDefaultOption("skip_retriangulation",
+                               &mapper->skip_retriangulation);
+   AddAndRegisterDefaultOption("skip_pruning", &mapper->skip_pruning);
++
++  // Options for parallel rigidity check in bundle adjustment and
++  // track pruning
++  AddAndRegisterDefaultOption("use_gpr_ba", &mapper->use_gpr_ba);
++  AddAndRegisterDefaultOption("use_hof_tracks", &mapper->use_hof_tracks);
+ }
+
+ void OptionManager::AddGlobalMapperFullOptions() {
+diff --git a/glomap/controllers/track_establishment.cc b/glomap/controllers/track_establishment.cc
+index d4396ed..0c911c5 100644
+--- a/glomap/controllers/track_establishment.cc
++++ b/glomap/controllers/track_establishment.cc
+@@ -19,6 +19,10 @@ size_t TrackEngine::EstablishFullTracks(
+ void TrackEngine::BlindConcatenation() {
+   // Initialize the union find data structure by connecting all the
+   // correspondences
++  // Using union find algorithm for generic parallel rigidity check
++  // Nodes are a pair of image_id and point1_idx
++  // and they are connected across different edges based on matches in
++  // image_pair
+   image_pair_t counter = 0;
+   for (auto pair : view_graph_.image_pairs) {
+     if ((counter + 1) % 1000 == 0 ||
+@@ -62,13 +66,12 @@ void TrackEngine::BlindConcatenation() {
+   std::cout << std::endl;
+ }
+
++// Redefining TrackCollection to make use of extra data stored in tracks and
++// image_pairs
+ void TrackEngine::TrackCollection(std::unordered_map<track_t, Track>& tracks) {
+-  std::unordered_map<uint64_t, std::unordered_set<uint64_t>> track_map;
+-  std::unordered_map<uint64_t, int> track_counter;
+-
+   // Create tracks from the connected components of the point correspondences
+   size_t counter = 0;
+-  for (auto pair : view_graph_.image_pairs) {
++  for (auto& pair : view_graph_.image_pairs) {
+     if ((counter + 1) % 1000 == 0 ||
+         counter == view_graph_.image_pairs.size() - 1) {
+       std::cout << "\r Establishing pairs " << counter + 1 << " / "
+@@ -76,7 +79,7 @@ void TrackEngine::TrackCollection(std::unordered_map<track_t, Track>& tracks) {
+     }
+     counter++;
+
+-    const ImagePair& image_pair = pair.second;
++    ImagePair& image_pair = pair.second;
+     if (!image_pair.is_valid) continue;
+
+     // Get the matches
+@@ -84,6 +87,8 @@ void TrackEngine::TrackCollection(std::unordered_map<track_t, Track>& tracks) {
+
+     // Get the inlier mask
+     const std::vector<int>& inliers = image_pair.inliers;
++    // Reserving track list memory
++    image_pair.track_list.reserve(inliers.size());
+
+     for (size_t i = 0; i < inliers.size(); i++) {
+       size_t idx = inliers[i];
+@@ -101,31 +106,52 @@ void TrackEngine::TrackCollection(std::unordered_map<track_t, Track>& tracks) {
+
+       image_pair_t track_id = uf_.Find(point_global_id1);
+
+-      track_map[track_id].insert(point_global_id1);
+-      track_map[track_id].insert(point_global_id2);
+-      track_counter[track_id]++;
++      // Below might happen multiple times but it will write the same value
++      tracks[track_id].track_id = track_id;
++      tracks[track_id].observations.emplace_back(image_pair.image_id1,
++                                                 point1_idx);
++      tracks[track_id].observations.emplace_back(image_pair.image_id2,
++                                                 point2_idx);
++
++      // Add track ids to the image_pair
++      image_pair.track_list[track_id] = false;
++      // Marking here as false, will be marked as true when the track is finally
++      // selected Add which edges are used to create the track
++      tracks[track_id].obs_img_pair_map[point_global_id1].insert(
++          image_pair.pair_id);
++      tracks[track_id].obs_img_pair_map[point_global_id2].insert(
++          image_pair.pair_id);
+     }
+   }
+   std::cout << std::endl;
+
+   counter = 0;
+   size_t discarded_counter = 0;
+-  for (auto& [track_id, correspondence_set] : track_map) {
+-    if ((counter + 1) % 1000 == 0 || counter == track_map.size() - 1) {
++  for (auto& [track_id, track] : tracks) {
++    if ((counter + 1) % 1000 == 0 || counter == tracks.size() - 1) {
+       std::cout << "\r Establishing tracks " << counter + 1 << " / "
+-                << track_map.size() << std::flush;
++                << tracks.size() << std::flush;
+     }
+     counter++;
+
+     std::unordered_map<image_t, std::vector<Eigen::Vector2d>> image_id_set;
+-    for (auto point_global_id : correspondence_set) {
+-      // image_id is the higher 32 bits and feature_id is the lower 32 bits
+-      image_t image_id = point_global_id >> 32;
+-      feature_t feature_id = point_global_id & 0xFFFFFFFF;
++    for (auto obs : track.observations) {
++      image_t image_id = obs.first;
++      feature_t feature_id = obs.second;
+       if (image_id_set.find(image_id) != image_id_set.end()) {
+         for (const auto& feature : image_id_set.at(image_id)) {
+           if ((feature - images_.at(image_id).features[feature_id]).norm() >
+               options_.thres_inconsistency) {
++            // Deleting links from image_pairs to the track
++            for (const auto& [obs2, img_pair_set] :
++                 tracks[track_id].obs_img_pair_map) {
++              for (const auto& img_pair_idx : img_pair_set)
++                view_graph_.image_pairs.at(img_pair_idx)
++                    .track_list.erase(track_id);
++            }
++            // Deleting links from track to image_pairs
++            tracks[track_id].obs_img_pair_map.clear();
++            // Deleting observations of the track
+             tracks[track_id].observations.clear();
+             break;
+           }
+@@ -140,8 +166,6 @@ void TrackEngine::TrackCollection(std::unordered_map<track_t, Track>& tracks) {
+
+       image_id_set[image_id].push_back(
+           images_.at(image_id).features[feature_id]);
+-
+-      tracks[track_id].observations.emplace_back(image_id, feature_id);
+     }
+   }
+
+@@ -191,6 +215,11 @@ size_t TrackEngine::FindTracksForProblem(
+       track_temp.track_id = track_id;
+       track_temp.observations.emplace_back(
+           std::make_pair(image_id, feature_id));
++      // Adding information about the image_pair
++      image_pair_t point_global_id = static_cast<image_pair_t>(image_id) << 32 |
++                                     static_cast<image_pair_t>(feature_id);
++      track_temp.obs_img_pair_map[point_global_id] =
++          track.obs_img_pair_map.at(point_global_id);
+       image_ids.insert(image_id);
+     }
+
+@@ -199,17 +228,22 @@ size_t TrackEngine::FindTracksForProblem(
+     // A flag to see if the track has already been added or not to avoid
+     // multiple insertion into the set to be efficient
+     bool added = false;
+-    // for (auto &image_id : image_ids) {
+     for (const auto& [image_id, feature_id] : track_temp.observations) {
+       // Getting the current number of tracks
+       auto& track_per_camera = tracks_per_camera[image_id];
+       if (track_per_camera > options_.min_num_tracks_per_view) continue;
+-
+       // Otherwise, increase the track number per camera
+       ++track_per_camera;
+       if (track_per_camera > options_.min_num_tracks_per_view) --cameras_left;
+
+       if (!added) {
++        // Marking track_list in edges to be true for the selected track
++        for (const auto& [obs, image_pairs_obs] : track_temp.obs_img_pair_map) {
++          for (const auto& image_pair_obs : image_pairs_obs) {
++            view_graph_.image_pairs.at(image_pair_obs)
++                .track_list.at(track_temp.track_id) = true;
++          }
++        }
+         tracks.insert(std::make_pair(track_id, track_temp));
+         added = true;
+       }
+diff --git a/glomap/controllers/track_establishment.h b/glomap/controllers/track_establishment.h
+index 7e0c3ef..b2634f0 100644
+--- a/glomap/controllers/track_establishment.h
++++ b/glomap/controllers/track_establishment.h
+@@ -25,7 +25,7 @@ struct TrackEstablishmentOptions {
+
+ class TrackEngine {
+  public:
+-  TrackEngine(const ViewGraph& view_graph,
++  TrackEngine(ViewGraph& view_graph,
+               const std::unordered_map<image_t, Image>& images,
+               const TrackEstablishmentOptions& options)
+       : options_(options), view_graph_(view_graph), images_(images) {}
+@@ -49,7 +49,8 @@ class TrackEngine {
+
+   const TrackEstablishmentOptions& options_;
+
+-  const ViewGraph& view_graph_;
++  ViewGraph& view_graph_;
++
+   const std::unordered_map<image_t, Image>& images_;
+
+   // Internal structure used for concatenating tracks
+diff --git a/glomap/estimators/global_positioning.cc b/glomap/estimators/global_positioning.cc
+index 298f23d..a2138d4 100644
+--- a/glomap/estimators/global_positioning.cc
++++ b/glomap/estimators/global_positioning.cc
+@@ -204,9 +204,9 @@ void GlobalPositioner::AddCameraToCameraConstraints(
+     problem_->SetParameterLowerBound(&scale, 0, 1e-5);
+   }
+
+-  VLOG(2) << problem_->NumResidualBlocks()
+-          << " camera to camera constraints were added to the position "
+-             "estimation problem.";
++  LOG(INFO) << problem_->NumResidualBlocks()
++            << " camera to camera constraints were added to the position "
++               "estimation problem.";
+ }
+
+ void GlobalPositioner::AddPointToCameraConstraints(
+@@ -221,9 +221,9 @@ void GlobalPositioner::AddPointToCameraConstraints(
+   // Find the tracks that are relevant to the current set of cameras
+   const size_t num_pt_to_cam = tracks.size();
+
+-  VLOG(2) << num_pt_to_cam
+-          << " point to camera constriants were added to the position "
+-             "estimation problem.";
++  LOG(INFO) << num_pt_to_cam
++            << " point to camera constraints were added to the position "
++               "estimation problem.";
+
+   if (num_pt_to_cam == 0) return;
+
+diff --git a/glomap/estimators/view_graph_calibration.cc b/glomap/estimators/view_graph_calibration.cc
+index a66b5a2..afbc93a 100644
+--- a/glomap/estimators/view_graph_calibration.cc
++++ b/glomap/estimators/view_graph_calibration.cc
+@@ -45,7 +45,9 @@ bool ViewGraphCalibrator::Solve(ViewGraph& view_graph,
+   CopyBackResults(cameras);
+   FilterImagePairs(view_graph);
+
+-  return summary.IsSolutionUsable();
++  // return summary.IsSolutionUsable();
++  // Overriding to run 1DSfM dataset -- NEEDS TO BE CHANGED BACK
++  return true;
+ }
+
+ void ViewGraphCalibrator::Reset(
+diff --git a/glomap/exe/global_mapper.cc b/glomap/exe/global_mapper.cc
+index f099f8b..c1ba856 100644
+--- a/glomap/exe/global_mapper.cc
++++ b/glomap/exe/global_mapper.cc
+@@ -16,6 +16,8 @@ namespace glomap {
+ int RunMapper(int argc, char** argv) {
+   std::string database_path;
+   std::string output_path;
++  // To save reconstruction without retriangulation
++  std::string output_path_wo_retri;
+
+   std::string image_path = "";
+   std::string constraint_type = "ONLY_POINTS";
+@@ -24,6 +26,7 @@ int RunMapper(int argc, char** argv) {
+   OptionManager options;
+   options.AddRequiredOption("database_path", &database_path);
+   options.AddRequiredOption("output_path", &output_path);
++  options.AddRequiredOption("output_path_wo_retri", &output_path_wo_retri);
+   options.AddDefaultOption("image_path", &image_path);
+   options.AddDefaultOption("constraint_type",
+                            &constraint_type,
+@@ -84,8 +87,16 @@ int RunMapper(int argc, char** argv) {
+   LOG(INFO) << "Loaded database";
+   colmap::Timer run_timer;
+   run_timer.Start();
+-  global_mapper.Solve(
+-      *database, view_graph, rigs, cameras, frames, images, tracks);
++  global_mapper.Solve(*database,
++                      view_graph,
++                      rigs,
++                      cameras,
++                      frames,
++                      images,
++                      tracks,
++                      output_path_wo_retri,
++                      image_path,
++                      output_format);
+   run_timer.Pause();
+
+   LOG(INFO) << "Reconstruction done in " << run_timer.ElapsedSeconds()
+diff --git a/glomap/glomap.cc b/glomap/glomap.cc
+index f9afc56..54fc962 100644
+--- a/glomap/glomap.cc
++++ b/glomap/glomap.cc
+@@ -10,7 +10,9 @@ namespace {
+ typedef std::function<int(int, char**)> command_func_t;
+ int ShowHelp(
+     const std::vector<std::pair<std::string, command_func_t>>& commands) {
+-  std::cout << "GLOMAP -- Global Structure-from-Motion" << std::endl
++  std::cout << "GLOMAP -- Global Structure-from-Motion [MODIFIED FOR GENERIC "
++               "PARALLEL RIGIDITY]"
++            << std::endl
+             << std::endl;
+
+ #ifdef GLOMAP_CUDA_ENABLED
+diff --git a/glomap/processors/track_filter.cc b/glomap/processors/track_filter.cc
+index 04410c4..84489bb 100644
+--- a/glomap/processors/track_filter.cc
++++ b/glomap/processors/track_filter.cc
+@@ -1,19 +1,93 @@
+ #include "glomap/processors/track_filter.h"
+
+ #include "glomap/math/rigid3d.h"
++#include "glomap/math/union_find.h"
++#include "glomap/scene/image_pair.h"
++
++#include <algorithm>
++#include <set>
+
+ namespace glomap {
+
++void RemoveEmptyTracks(std::unordered_map<track_t, Track>& tracks) {
++  size_t tracks_init_size = tracks.size();
++  std::vector<track_t> temp_track_list;  // tracks to be deleted
++  int counter = 0;
++  for (auto& [track_id, track] : tracks)
++    if (track.observations.size() == 0) {
++      temp_track_list.push_back(track_id);
++      counter++;
++    }
++
++  for (auto& track_id : temp_track_list) tracks.erase(track_id);
++
++  LOG(INFO) << "Deleting " << counter << " / " << tracks_init_size
++            << " tracks with zero observations";
++}
++
++// Function to remove isolated observations after filtering of tracks
++void TrackObsCleanup(const ViewGraph& view_graph,
++                     std::unordered_map<track_t, Track>& tracks) {
++  std::vector<image_pair_t> remove_image_pair_indices, remove_obs_indices;
++  std::vector<track_t>
++      remove_track_idx;  // Tracks to be removed if no. of observations < 2
++  for (auto& [track_id, track] : tracks) {
++    // Removing non-existant image_pair indices
++    remove_obs_indices.clear();
++    std::vector<Observation> observations_new;
++    for (auto& [obs, image_pair_set] : track.obs_img_pair_map) {
++      remove_image_pair_indices.clear();
++      for (const auto& image_pair_idx : image_pair_set)
++        if (!view_graph.image_pairs.at(image_pair_idx).is_valid ||
++            !view_graph.image_pairs.at(image_pair_idx)
++                 .track_list.at(track.track_id))
++          remove_image_pair_indices.push_back(image_pair_idx);
++
++      for (auto& rem_idx : remove_image_pair_indices)
++        image_pair_set.erase(rem_idx);
++
++      // Remove isolated observations
++      if (image_pair_set.size() == 0) {
++        remove_obs_indices.push_back(obs);
++      } else {
++        image_t image_id = obs >> 32;
++        feature_t feature_id = obs & 0xFFFFFFFF;
++        observations_new.emplace_back(image_id, feature_id);
++      }
++    }
++
++    // Remove observations and obs_img_pair_map
++    for (auto& rem_idx : remove_obs_indices)
++      track.obs_img_pair_map.erase(rem_idx);
++
++    if (observations_new.size() < 2) remove_track_idx.push_back(track_id);
++
++    track.observations = observations_new;
++  }
++
++  int counter = 0;
++  for (const auto& tr_idx : remove_track_idx) {
++    tracks.erase(tr_idx);
++    counter++;
++  }
++
++  LOG(INFO) << "Track cleaning up done by deleting " << counter << " tracks!";
++  LOG(INFO) << "Tracks remaining: " << tracks.size();
++}
++
+ int TrackFilter::FilterTracksByReprojection(
+-    const ViewGraph& view_graph,
++    ViewGraph& view_graph,
+     const std::unordered_map<camera_t, Camera>& cameras,
+     const std::unordered_map<image_t, Image>& images,
+     std::unordered_map<track_t, Track>& tracks,
+     double max_reprojection_error,
+-    bool in_normalized_image) {
++    bool in_normalized_image,
++    bool prune_obs) {
+   int counter = 0;
++  size_t tracks_init_size = tracks.size();
+   for (auto& [track_id, track] : tracks) {
+-    std::vector<Observation> observation_new;
++    // Marking and removing discarded observations
++    std::vector<Observation> observation_new, observations_discarded;
+     for (auto& [image_id, feature_id] : track.observations) {
+       const Image& image = images.at(image_id);
+       Eigen::Vector3d pt_calc = image.CamFromWorld() * track.xyz;
+@@ -39,29 +113,55 @@ int TrackFilter::FilterTracksByReprojection(
+       // If the reprojection error is smaller than the threshold, then keep it
+       if (reprojection_error < max_reprojection_error) {
+         observation_new.emplace_back(image_id, feature_id);
++      } else {
++        // Saving the observations to discard
++        observations_discarded.emplace_back(
++            std::make_pair(image_id, feature_id));
+       }
+     }
+     if (observation_new.size() != track.observations.size()) {
+       counter++;
+       track.observations = observation_new;
++      for (const auto& obs : observations_discarded) {
++        image_pair_t point_global_id = static_cast<image_pair_t>(obs.first)
++                                           << 32 |
++                                       static_cast<image_pair_t>(obs.second);
++
++        for (const auto& image_pair_obs :
++             track.obs_img_pair_map[point_global_id])
++          view_graph.image_pairs.at(image_pair_obs)
++              .track_list.at(track.track_id) = false;
++
++        track.obs_img_pair_map.erase(point_global_id);
++      }
+     }
+   }
+-  LOG(INFO) << "Filtered " << counter << " / " << tracks.size()
++
++  // Cleaning isolated observations
++  if (prune_obs)
++    TrackObsCleanup(view_graph, tracks);
++  else
++    RemoveEmptyTracks(tracks);
++
++  LOG(INFO) << "Filtered " << counter << " / " << tracks_init_size
+             << " tracks by reprojection error";
+   return counter;
+ }
+
+ int TrackFilter::FilterTracksByAngle(
+-    const ViewGraph& view_graph,
++    ViewGraph& view_graph,
+     const std::unordered_map<camera_t, Camera>& cameras,
+     const std::unordered_map<image_t, Image>& images,
+     std::unordered_map<track_t, Track>& tracks,
+-    double max_angle_error) {
++    double max_angle_error,
++    bool prune_obs) {
+   int counter = 0;
++  size_t tracks_init_size = tracks.size();
+   double thres = std::cos(DegToRad(max_angle_error));
+   double thres_uncalib = std::cos(DegToRad(max_angle_error * 2));
+   for (auto& [track_id, track] : tracks) {
+-    std::vector<Observation> observation_new;
++    // Marking and removing discarded observations
++    std::vector<Observation> observation_new, observations_discarded;
+     for (auto& [image_id, feature_id] : track.observations) {
+       const Image& image = images.at(image_id);
+       // const Camera& camera = image.camera;
+@@ -77,24 +177,48 @@ int TrackFilter::FilterTracksByAngle(
+
+       if (pt_calc.dot(feature_undist) > thres_cam) {
+         observation_new.emplace_back(std::make_pair(image_id, feature_id));
++      } else {
++        // Saving the observations to discard
++        observations_discarded.emplace_back(
++            std::make_pair(image_id, feature_id));
+       }
+     }
+     if (observation_new.size() != track.observations.size()) {
+       counter++;
+       track.observations = observation_new;
++      for (const auto& obs : observations_discarded) {
++        image_pair_t point_global_id = static_cast<image_pair_t>(obs.first)
++                                           << 32 |
++                                       static_cast<image_pair_t>(obs.second);
++
++        for (const auto& image_pair_obs :
++             track.obs_img_pair_map[point_global_id])
++          view_graph.image_pairs.at(image_pair_obs)
++              .track_list.at(track.track_id) = false;
++
++        track.obs_img_pair_map.erase(point_global_id);
++      }
+     }
+   }
+-  LOG(INFO) << "Filtered " << counter << " / " << tracks.size()
++
++  // Cleaning isolated observations
++  if (prune_obs)
++    TrackObsCleanup(view_graph, tracks);
++  else
++    RemoveEmptyTracks(tracks);
++
++  LOG(INFO) << "Filtered " << counter << " / " << tracks_init_size
+             << " tracks by angle error";
+   return counter;
+ }
+
+ int TrackFilter::FilterTrackTriangulationAngle(
+-    const ViewGraph& view_graph,
++    ViewGraph& view_graph,
+     const std::unordered_map<image_t, Image>& images,
+     std::unordered_map<track_t, Track>& tracks,
+     double min_angle) {
+   int counter = 0;
++  size_t tracks_init_size = tracks.size();
+   double thres = std::cos(DegToRad(min_angle));
+   for (auto& [track_id, track] : tracks) {
+     std::vector<Observation> observation_new;
+@@ -118,12 +242,328 @@ int TrackFilter::FilterTrackTriangulationAngle(
+     // If the triangulation angle is too small, just remove it
+     if (!status) {
+       counter++;
++      // Remove track_id from track_list in edges
++      for (const auto& [obs, image_pairs_obs] : track.obs_img_pair_map)
++        for (const auto& image_pair_obs : image_pairs_obs)
++          view_graph.image_pairs.at(image_pair_obs)
++              .track_list.at(track.track_id) = false;
++
++      track.obs_img_pair_map.clear();
+       track.observations.clear();
+     }
+   }
+-  LOG(INFO) << "Filtered " << counter << " / " << tracks.size()
++
++  RemoveEmptyTracks(tracks);
++  LOG(INFO) << "Filtered " << counter << " / " << tracks_init_size
+             << " tracks by too small triangulation angle";
++
+   return counter;
+ }
+
++// Function to ensure generic parallel rigidity in tracks (BA problem) via
++// viewgraph Note: Retiangulation functionality is not supported with generic
++// parallel rigidity check as new set of tracks are constructed and do not have
++// a new viewgraph object from which the new tracks are constructed.
++
++int TrackFilter::FilterTracksGenericParallelRigidityViaViewgraph(
++    ViewGraph& view_graph,
++    std::unordered_map<frame_t, Frame>& frames,
++    std::unordered_map<image_t, Image>& images,
++    std::unordered_map<track_t, Track>& tracks) {
++  int num_initial_tracks = tracks.size();
++
++  // Step 1: Recursively remove edges with tracks < 2 and tracks of length < 2
++  {
++    image_pair_t num_edges_modified, total_num_edges_modified = 0;
++    track_t num_tracks_modified, total_num_tracks_modified = 0;
++    std::vector<track_t> temp_track_list;
++
++    do {
++      num_edges_modified = 0;
++      num_tracks_modified = 0;
++
++      // Checking through edges
++      for (auto& [image_pair_idx, image_pair] : view_graph.image_pairs) {
++        if (!image_pair.is_valid) continue;
++
++        temp_track_list.clear();
++        for (const auto& tle : image_pair.track_list) {
++          if (tle.second) temp_track_list.push_back(tle.first);
++
++          if (temp_track_list.size() > 1)  // tracks per edge
++            break;
++        }
++
++        if (temp_track_list.size() < 2) {
++          // Remove the image pair from viewgraph
++          image_pair.is_valid = false;
++
++          if (temp_track_list.size() == 1) {
++            // Updating track
++            for (auto& [obs, image_pair_set] :
++                 tracks[temp_track_list[0]].obs_img_pair_map)
++              if (image_pair_set.find(image_pair.pair_id) !=
++                  image_pair_set.end()) {
++                image_pair_set.erase(image_pair.pair_id);
++                break;
++              }
++
++            // Updating image_pair
++            image_pair.track_list.at(temp_track_list[0]) = false;
++
++            num_edges_modified++;
++          }
++        }
++      }
++
++      total_num_edges_modified += num_edges_modified;
++
++      // Checking through tracks
++      temp_track_list.clear();
++      for (auto& [track_id, track] : tracks) {
++        if (track.observations.size() < 2) {
++          temp_track_list.push_back(track_id);  // tracks to be deleted
++
++          if (track.observations.size() == 1) {
++            // Remove tracks in edges
++            for (const auto& [obs, image_pair_set] : track.obs_img_pair_map)
++              for (const auto& image_pair_idx : image_pair_set)
++                view_graph.image_pairs.at(image_pair_idx)
++                    .track_list.erase(track_id);
++          }
++        }
++      }
++
++      for (auto& track_id : temp_track_list) tracks.erase(track_id);
++
++      num_tracks_modified = temp_track_list.size();
++      total_num_tracks_modified += num_tracks_modified;
++
++    } while (num_edges_modified != 0 || num_tracks_modified != 0);
++
++    LOG(INFO) << "Modified " << total_num_edges_modified << " edges and "
++              << total_num_tracks_modified
++              << " tracks (non-unique counts) in step 1 of PR in BA";
++
++    LOG(INFO) << "Tracks remaining after step 1 of PR in BA: " << tracks.size()
++              << " from initial: " << num_initial_tracks;
++  }
++
++  // Keeping only largest connected component
++  // This updates adjacency_list and images as well
++  if (view_graph.KeepLargestConnectedComponents(frames, images) == 0) {
++    LOG(ERROR) << "no connected components are found";
++    return 0;
++  }
++
++  // Step 2: Find edges in viewgraph whose scales are fixed
++  // Using union find algorithm over edges to get connected components
++
++  // Expected input: Tracks with length >=2 and edges with atleast 2 tracks
++  // We use union find to check which scales are connected via tracks
++  UnionFind<image_pair_t> uf;
++  uf.Clear();
++
++  std::unordered_set<image_pair_t> valid_image_pair_list;
++
++  const std::unordered_map<image_t, std::unordered_set<image_t>>&
++      adjacency_list = view_graph.GetAdjacencyList();
++
++  image_pair_t adj_img_pair_id;
++  std::vector<track_t> tr_list_image_pair, tr_list_adj_image_pair,
++      common_tr_list;
++
++  for (const auto& [image_pair_idx, image_pair] : view_graph.image_pairs) {
++    if (!image_pair.is_valid) continue;
++    valid_image_pair_list.insert(image_pair.pair_id);
++
++    tr_list_image_pair.clear();
++    for (const auto& [tr_idx, tr_status] : image_pair.track_list)
++      if (tr_status) tr_list_image_pair.push_back(tr_idx);
++
++    std::sort(tr_list_image_pair.begin(), tr_list_image_pair.end());
++
++    const auto& image_set_1 = adjacency_list.at(image_pair.image_id1);
++    const auto& image_set_2 = adjacency_list.at(image_pair.image_id2);
++
++    for (const auto& img : image_set_1) {
++      adj_img_pair_id = ImagePair::ImagePairToPairId(image_pair.image_id1, img);
++      if (view_graph.image_pairs.at(adj_img_pair_id).is_valid &&
++          uf.Find(image_pair.pair_id) != uf.Find(adj_img_pair_id)) {
++        tr_list_adj_image_pair.clear();
++        for (const auto& [tr_idx, tr_status] :
++             view_graph.image_pairs.at(adj_img_pair_id).track_list)
++          if (tr_status) tr_list_adj_image_pair.push_back(tr_idx);
++
++        std::sort(tr_list_adj_image_pair.begin(), tr_list_adj_image_pair.end());
++
++        // The two image pairs should have atleast 1 common track to share the
++        // scale
++        common_tr_list.clear();
++        std::set_intersection(
++            tr_list_image_pair.begin(),
++            tr_list_image_pair.end(),
++            tr_list_adj_image_pair.begin(),
++            tr_list_adj_image_pair.end(),
++            std::inserter(common_tr_list, common_tr_list.begin()));
++        if (common_tr_list.size())
++          uf.Union(image_pair.pair_id, adj_img_pair_id);
++      }
++    }
++
++    for (const auto& img : image_set_2) {
++      adj_img_pair_id = ImagePair::ImagePairToPairId(image_pair.image_id2, img);
++      if (view_graph.image_pairs.at(adj_img_pair_id).is_valid &&
++          uf.Find(image_pair.pair_id) != uf.Find(adj_img_pair_id)) {
++        tr_list_adj_image_pair.clear();
++        for (const auto& [tr_idx, tr_status] :
++             view_graph.image_pairs.at(adj_img_pair_id).track_list)
++          if (tr_status) tr_list_adj_image_pair.push_back(tr_idx);
++
++        std::sort(tr_list_adj_image_pair.begin(), tr_list_adj_image_pair.end());
++
++        // The two image pairs should have atleast 1 common track to share the
++        // scale
++        common_tr_list.clear();
++        std::set_intersection(
++            tr_list_image_pair.begin(),
++            tr_list_image_pair.end(),
++            tr_list_adj_image_pair.begin(),
++            tr_list_adj_image_pair.end(),
++            std::inserter(common_tr_list, common_tr_list.begin()));
++
++        if (common_tr_list.size())
++          uf.Union(image_pair.pair_id, adj_img_pair_id);
++      }
++    }
++  }
++
++  LOG(INFO) << "No. of valid image pairs: " << valid_image_pair_list.size()
++            << std::endl;
++
++  LOG(INFO) << "Obtained Union Find DS of edges in step 2 of PR in BA";
++
++  // Each component in union find data structure represents shared scales
++  // We only need to check if there are common atleast 2 tracks across two
++  // components
++
++  // Step 3: Merge components which have atleast two tracks in common
++
++  // Finding connected components of the edge graph
++  // Connected components of edge graph
++  std::unordered_map<image_pair_t, std::unordered_set<image_pair_t>>
++      cc_edge_graph;
++  // Track list in each connected component
++  std::unordered_map<image_pair_t, std::set<track_t>> cc_track_list;
++
++  for (const auto& img_pair_idx : valid_image_pair_list) {
++    auto root_val = uf.Find(img_pair_idx);
++    cc_edge_graph[root_val].insert(img_pair_idx);
++
++    for (const auto& [tr_idx, tr_status] :
++         view_graph.image_pairs.at(img_pair_idx).track_list)
++      if (tr_status) cc_track_list[root_val].insert(tr_idx);
++  }
++
++  // Extracting root values as in uf
++  std::vector<image_pair_t> root_values;
++  std::vector<track_t> ccs_common_tr_list;
++  root_values.reserve(cc_track_list.size());
++  for (auto& [root, track_set] : cc_track_list) root_values.push_back(root);
++
++  int prev_num_conn_comp, num_conn_comp = root_values.size();
++  bool merge_flag;
++
++  std::cout << "No. of connected components in the edge graph: "
++            << root_values.size() << std::endl;
++
++  do {
++    prev_num_conn_comp = num_conn_comp;
++    merge_flag = false;
++    int i = 0, j = 0;
++    for (i = 0; i < root_values.size() - 1; i++) {
++      for (j = i + 1; j < root_values.size(); j++) {
++        ccs_common_tr_list.clear();
++        std::set_intersection(
++            cc_track_list[root_values[i]].begin(),
++            cc_track_list[root_values[i]].end(),
++            cc_track_list[root_values[j]].begin(),
++            cc_track_list[root_values[j]].end(),
++            std::inserter(ccs_common_tr_list, ccs_common_tr_list.begin()));
++
++        // Merge if there are two or more common tracks
++        if (ccs_common_tr_list.size() > 1) {
++          merge_flag = true;
++          break;
++        }
++      }
++
++      if (merge_flag) break;
++    }
++
++    if (merge_flag) {
++      cc_edge_graph[root_values[i]].insert(
++          cc_edge_graph[root_values[j]].begin(),
++          cc_edge_graph[root_values[j]].end());
++      cc_edge_graph.erase(root_values[j]);
++
++      cc_track_list[root_values[i]].insert(
++          cc_track_list[root_values[j]].begin(),
++          cc_track_list[root_values[j]].end());
++      cc_track_list.erase(root_values[j]);
++
++      root_values.erase(std::next(root_values.begin(), j));
++
++      num_conn_comp = root_values.size();
++
++      LOG(INFO) << "i: " << i << ", j: " << j << " merged!\n";
++    }
++
++    LOG(INFO) << "Prev Conn Comp: " << prev_num_conn_comp
++              << ", Curr Conn Comp: " << num_conn_comp << std::endl;
++  } while (prev_num_conn_comp != num_conn_comp);
++
++  LOG(INFO) << "Obtained largest connected component of Union Find DS in step "
++               "3 of PR in BA\n";
++
++  // Only retain largest cc of edge graph
++  // Update edges to be false
++  // Update tracks to remove edge idx
++
++  uint size_max_cc = 0, idx_max_cc = 0;
++  for (int i = 0; i < root_values.size(); i++) {
++    if (size_max_cc < cc_edge_graph[root_values[i]].size()) {
++      size_max_cc = cc_edge_graph[root_values[i]].size();
++      idx_max_cc = i;
++    }
++  }
++
++  LOG(INFO) << "No. of edges in max connected component of edge graph: "
++            << size_max_cc << std::endl;
++
++  for (const auto& root_val : root_values) {
++    if (root_val == root_values[idx_max_cc]) continue;
++
++    for (const auto& image_pair_idx : cc_edge_graph[root_val])
++      view_graph.image_pairs.at(image_pair_idx).is_valid = false;
++  }
++
++  TrackObsCleanup(view_graph, tracks);
++
++  image_t num_imgs = view_graph.KeepLargestConnectedComponents(frames, images);
++  if (num_imgs == 0) {
++    LOG(ERROR) << "no connected components are found";
++    return 0;
++  } else {
++    LOG(INFO)
++        << num_imgs
++        << " images are within the largest connected component of viewgraph";
++  }
++
++  LOG(INFO) << "Tracks before PR filtering: " << num_initial_tracks
++            << ", after PR filtering: " << tracks.size() << std::endl;
++
++  return tracks.size();
++}
++
+ }  // namespace glomap
+\ No newline at end of file
+diff --git a/glomap/processors/track_filter.h b/glomap/processors/track_filter.h
+index befe341..de7cb64 100644
+--- a/glomap/processors/track_filter.h
++++ b/glomap/processors/track_filter.h
+@@ -6,25 +6,34 @@ namespace glomap {
+
+ struct TrackFilter {
+   static int FilterTracksByReprojection(
+-      const ViewGraph& view_graph,
++      ViewGraph& view_graph,
+       const std::unordered_map<camera_t, Camera>& cameras,
+       const std::unordered_map<image_t, Image>& images,
+       std::unordered_map<track_t, Track>& tracks,
+       double max_reprojection_error = 1e-2,
+-      bool in_normalized_image = true);
++      bool in_normalized_image = true,
++      bool prune_obs = false);
+
+   static int FilterTracksByAngle(
+-      const ViewGraph& view_graph,
++      ViewGraph& view_graph,
+       const std::unordered_map<camera_t, Camera>& cameras,
+       const std::unordered_map<image_t, Image>& images,
+       std::unordered_map<track_t, Track>& tracks,
+-      double max_angle_error = 1.);
++      double max_angle_error = 1.,
++      bool prune_obs = false);
+
+   static int FilterTrackTriangulationAngle(
+-      const ViewGraph& view_graph,
++      ViewGraph& view_graph,
+       const std::unordered_map<image_t, Image>& images,
+       std::unordered_map<track_t, Track>& tracks,
+       double min_angle = 1.);
++
++  // Adding function for generic parallel rigidity (BA problem) via viewgraph
++  static int FilterTracksGenericParallelRigidityViaViewgraph(
++      ViewGraph& view_graph,
++      std::unordered_map<frame_t, Frame>& frames,
++      std::unordered_map<image_t, Image>& images,
++      std::unordered_map<track_t, Track>& tracks);
+ };
+
+ }  // namespace glomap
+diff --git a/glomap/scene/image_pair.h b/glomap/scene/image_pair.h
+index 67bf2ed..be79ad2 100644
+--- a/glomap/scene/image_pair.h
++++ b/glomap/scene/image_pair.h
+@@ -50,6 +50,12 @@ struct ImagePair {
+   // Row index of inliers in the matches matrix.
+   std::vector<int> inliers;
+
++  // Adding the list of tracks which use this edge
++  // Bool is useful when observations are filtered from tracks
++  // Ideally, there should be a map of track_t to row index in matches
++  // (only for inliers)
++  std::unordered_map<track_t, bool> track_list;
++
+   static inline image_pair_t ImagePairToPairId(const image_t image_id1,
+                                                const image_t image_id2);
+
+diff --git a/glomap/scene/track.h b/glomap/scene/track.h
+index 63ab805..d01fc4f 100644
+--- a/glomap/scene/track.h
++++ b/glomap/scene/track.h
+@@ -24,6 +24,12 @@ struct Track {
+
+   // The list where the track is observed (image_id, feature_id)
+   std::vector<Observation> observations;
++
++  // Adding list of image pairs for which are used in this track
++  // Using first 32 bits for image_id and last 32 bits for point_idx in
++  // image_pair_t for saving observations
++  std::unordered_map<image_pair_t, std::unordered_set<image_pair_t> >
++      obs_img_pair_map;
+ };
+
+ }  // namespace glomap
