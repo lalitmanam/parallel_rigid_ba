@@ -88,9 +88,10 @@ If you use this code, please cite the following:
 
 ```BibTeX
 @inproceedings{manam2026gprba,
-    author = {Lalit Manam and Venu Madhav Govindu},
     title = {{Parallel Rigidity Matters for Bundle Adjustment}},
-    booktitle = {IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
+    author={Manam, Lalit and Govindu, Venu Madhav},
+    booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition},
+    pages={29035--29046},
     year = 2026,
 }
 ```
